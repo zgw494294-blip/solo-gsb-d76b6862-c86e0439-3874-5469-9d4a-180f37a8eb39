@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .custody import audit_custody
 from .gs1 import ScanParseError, parse_scan
 from .matcher import match_rules
-from .models import CheckRequest, CheckResponse, ScanErrorBody, ScanFields, ScanResult
+from .models import (
+    CheckRequest,
+    CheckResponse,
+    CustodyAuditRequest,
+    CustodyAuditResponse,
+    ScanErrorBody,
+    ScanFields,
+    ScanResult,
+)
 
 app = FastAPI(
-    title="GS1 召回扫码核验 API",
+    title="GS1 召回扫码核验 / 实物交接审计 API",
     version="1.0.0",
-    summary="解析 GS1 扫描串(AI 01/10/17/21)并逐条匹配召回规则",
+    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配与实物持有人链审计",
 )
 
 
@@ -50,3 +59,9 @@ def recall_check(request: CheckRequest) -> CheckResponse:
             )
         )
     return CheckResponse(results=results)
+
+
+@app.post("/v1/custody/audit", response_model=CustodyAuditResponse, tags=["custody"])
+def custody_audit(request: CustodyAuditRequest) -> CustodyAuditResponse:
+    """审计 1~300 条实物交接事件,回放持有人链并校验批号 / 有效期一致性。"""
+    return audit_custody(request)

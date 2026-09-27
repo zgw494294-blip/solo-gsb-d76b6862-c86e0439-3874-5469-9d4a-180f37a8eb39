@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date as dt_date
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -94,3 +95,64 @@ class ScanResult(BaseModel):
 
 class CheckResponse(BaseModel):
     results: list[ScanResult]
+
+
+# ---------- POST /v1/custody/audit ----------
+
+
+class CustodyEvent(BaseModel):
+    """一条实物交接事件。
+
+    scan 为 GS1 扫描串(须含 AI 01/21);occurred_at 须带时区;
+    from_location 首次交接须为 null,其后须等于上一成功事件的 to_location;
+    to_location 为非空的接收位置。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan: str = Field(min_length=1, max_length=512)
+    occurred_at: datetime
+    from_location: str | None = Field(default=None, max_length=128)
+    to_location: str = Field(min_length=1, max_length=128)
+
+    @field_validator("from_location")
+    @classmethod
+    def _from_location_nonempty(cls, v: str | None) -> str | None:
+        if v is not None and not v:
+            raise ValueError("from_location 可为 null 或非空字符串,不能为空字符串")
+        return v
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _occurred_at_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("occurred_at 必须带时区信息,如 2026-09-26T08:00:00+08:00")
+        return v
+
+
+class CustodyAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[CustodyEvent] = Field(min_length=1, max_length=300)
+
+
+class CustodyItem(BaseModel):
+    """单件实物(GTIN + 序列号)的成功流转结果。"""
+
+    gtin: str
+    serial: str
+    event_indices: list[int] = Field(description="成功事件的原始下标,按处理顺序(UTC 升序)")
+    holder: str = Field(description="最终持有人,即最后一次成功事件的 to_location")
+
+
+class CustodyFailure(BaseModel):
+    """按原始下标记录的失败事件;offset 仅在扫描串解析失败时存在。"""
+
+    index: int
+    reason: str
+    offset: int | None = None
+
+
+class CustodyAuditResponse(BaseModel):
+    items: list[CustodyItem]  # 按 (GTIN, 序列号) 排序
+    failures: list[CustodyFailure]  # 按原始下标排序

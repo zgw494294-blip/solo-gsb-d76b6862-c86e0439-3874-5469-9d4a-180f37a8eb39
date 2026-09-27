@@ -1,6 +1,9 @@
-# GS1 召回扫码核验 API
+# GS1 召回扫码核验 / 实物交接审计 API
 
-基于 FastAPI 的 GS1 条码解析与召回规则匹配服务。上传一批扫描串和一批召回规则,逐条返回解析出的字段(GTIN / 批号 / 序列号 / 日期)以及命中的规则 ID。
+基于 FastAPI 的 GS1 条码解析服务,提供两个接口:
+
+- **召回核验** `POST /v1/recall/check`:上传一批扫描串和一批召回规则,逐条返回解析出的字段(GTIN / 批号 / 序列号 / 日期)以及命中的规则 ID。
+- **交接审计** `POST /v1/custody/audit`:上传 1~300 条实物交接事件(扫描串 + 带时区的交接时间 + 来源 / 目的位置),以 GTIN + 序列号识别每件实物,按 UTC 时间回放持有人链,返回每件实物的成功事件与最终持有人,以及失败事件原因。
 
 ## 快速启动
 
@@ -10,7 +13,7 @@ docker compose up --build
 
 服务监听 **8000** 端口:
 
-- 接口:`POST http://localhost:8000/v1/recall/check`
+- 接口:`POST http://localhost:8000/v1/recall/check`、`POST http://localhost:8000/v1/custody/audit`
 - 交互文档:`http://localhost:8000/docs`
 - 健康检查:`GET http://localhost:8000/healthz`
 
@@ -114,16 +117,118 @@ curl -s http://localhost:8000/v1/recall/check \
 
 > JSON 中 FNC1 写作 `\u001d`;shell 里也可用 `$'...\x1d...'` 构造。
 
+### `POST /v1/custody/audit`
+
+审计一批实物交接事件。请求体:
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `events` | `object[]` | 1~300 条事件 |
+| `events[].scan` | `string` | GS1 扫描串(语法同上),须含 AI 01(GTIN)与 AI 21(序列号) |
+| `events[].occurred_at` | `string` | 交接时间,**必须带时区**(ISO 8601,如 `2026-09-26T08:00:00+08:00`) |
+| `events[].from_location` | `string \| null` | 交出方;首次交接须为 `null`,其后须等于上一成功事件的 `to_location` |
+| `events[].to_location` | `string` | 接收方,**非空**(1~128 字符) |
+
+请求体不合法(事件数超限、`occurred_at` 不带时区、`to_location` 为空、多余字段等)时整个请求返回 **422**。
+
+#### 审计规则
+
+1. **解析与身份识别**:逐条复用与召回核验相同的 GS1 解析。扫描串非法、或缺少 AI 21 序列号的事件按**原始下标**记入 `failures`,**不参与流转**。
+2. **时间排序**:参与流转的事件统一转换为 UTC,按 `(UTC 时间, 原始下标)` 升序处理——同一时刻依输入顺序。
+3. **持有人链**:对每件实物(GTIN + 序列号):
+   - 时间上的首次事件 `from_location` 须为 `null`(否则失败,实物状态不建立);
+   - 之后每条事件的 `from_location` 须等于上一成功事件的 `to_location`;
+   - 批号(AI 10)与有效期(AI 17)须与**首次成功扫描**一致,**字段缺失也参与比较**(首次缺批号、后来带批号也算冲突);
+   - 任一校验不通过的事件按原始下标记入 `failures`,**不改变持有人**;其后的事件仍以原持有人继续校验。
+4. **响应排序**:`items` 按 `(GTIN, 序列号)` 排序;`failures` 按原始下标排序。
+
+#### 响应
+
+```json
+{
+  "items": [
+    {
+      "gtin": "09506001123454",
+      "serial": "SN9",
+      "event_indices": [0, 1, 3],
+      "holder": "CUSTOMER-C"
+    }
+  ],
+  "failures": [
+    { "index": 2, "reason": "持有人不一致: from_location 须等于上一成功事件的 to_location 'STORE-B',实际为 'WAREHOUSE-X'", "offset": null },
+    { "index": 4, "reason": "未知 AI: '99'", "offset": 16 }
+  ]
+}
+```
+
+- `items[].event_indices`:该实物**成功事件**的原始下标,按处理顺序(UTC 升序;同一时刻按输入顺序)排列。
+- `items[].holder`:最终持有人,即最后一次成功事件的 `to_location`。全程无成功事件的实物不出现在 `items` 中。
+- `failures[].index`:失败事件的**原始下标**;`reason` 为原因(扫描非法、缺少序列号、首次交接来源非 null、持有人不一致、批号 / 有效期冲突等)。
+- `failures[].offset` 仅在扫描串解析失败时存在,语义同召回核验(相对原始扫描串、含 `]d2` 前缀,从 0 计);其余失败为 `null`。
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/v1/custody/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {
+        "scan": "]d201095060011234541725123110LOT1\u001d21SN9",
+        "occurred_at": "2026-09-25T09:00:00+08:00",
+        "from_location": null,
+        "to_location": "WAREHOUSE-A"
+      },
+      {
+        "scan": "01095060011234541725123110LOT1\u001d21SN9",
+        "occurred_at": "2026-09-26T02:00:00+00:00",
+        "from_location": "WAREHOUSE-A",
+        "to_location": "STORE-B"
+      },
+      {
+        "scan": "01095060011234541725123110LOT2\u001d21SN9",
+        "occurred_at": "2026-09-26T18:00:00+09:00",
+        "from_location": "STORE-B",
+        "to_location": "CUSTOMER-C"
+      }
+    ]
+  }'
+```
+
+上例前两条事件成功(时间分别为 UTC `2026-09-25 01:00`、`2026-09-26 02:00`);第三条批号为 `LOT2`,与首次成功扫描的 `LOT1` 冲突,记为失败且持有人停留在 `STORE-B`。响应:
+
+```json
+{
+  "items": [
+    {
+      "gtin": "09506001123454",
+      "serial": "SN9",
+      "event_indices": [0, 1],
+      "holder": "STORE-B"
+    }
+  ],
+  "failures": [
+    {
+      "index": 2,
+      "reason": "批号冲突: 与首次成功扫描不一致,期望 'LOT1',实际 'LOT2'",
+      "offset": null
+    }
+  ]
+}
+```
+
 ## 项目结构
 
 ```
 app/
   main.py     # FastAPI 入口与路由
   gs1.py      # GS1 扫描串解析(AI 01/10/17/21、FNC1、]d2、校验位、日期)
-  models.py   # 请求 / 响应模型与规则校验
+  models.py   # 请求 / 响应模型与字段校验
   matcher.py  # 召回规则匹配
+  custody.py  # 实物交接审计(时间排序回放、持有人链与批号/有效期一致性)
 tests/
   test_recall.py
+  test_custody.py
 Dockerfile
 docker-compose.yml
 requirements.txt
